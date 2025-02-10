@@ -1,5 +1,0 @@
-Youtube/
-.streamlit/secrets.toml
-parameters.config
-__pycache__/
-*.log
