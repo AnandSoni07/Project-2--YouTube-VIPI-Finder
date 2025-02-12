@@ -23,6 +23,8 @@ from googleapiclient.errors import HttpError
 from google.cloud import storage
 from google.oauth2 import service_account
 
+import pytz  # For handling timezones
+
 ##############################################################################
 # GLOBALS/CONFIG
 ##############################################################################
@@ -41,6 +43,9 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
+
+# Define the Pacific timezone
+PACIFIC_TZ = pytz.timezone("US/Pacific")
 
 ##############################################################################
 # 1) LOAD / SAVE USAGE FROM GCS
@@ -97,7 +102,7 @@ def get_storage_client():
     return storage.Client(credentials=creds, project=creds.project_id)
 
 def load_daily_usage():
-    """Load usage from GCS if usage.json is for today's date, else 0."""
+    """Load usage from GCS if usage.json is for today's (Pacific) date, else reset to 0."""
     try:
         client = get_storage_client()
         if not client:
@@ -112,7 +117,10 @@ def load_daily_usage():
         data_str = blob.download_as_text()
         data = json.loads(data_str)
         usage_date = data.get("usage_date")
-        if usage_date == str(datetime.now().date()):
+
+        # Compare with today's date in Pacific
+        today_pacific = datetime.now(PACIFIC_TZ).date()
+        if usage_date == str(today_pacific):
             return data.get("daily_usage", 0), usage_date
         else:
             return 0, None
@@ -122,10 +130,11 @@ def load_daily_usage():
         return 0, None
 
 def save_daily_usage(usage):
-    """Save daily usage to GCS as usage.json."""
+    """Save daily usage to GCS as usage.json, keyed by today's (Pacific) date."""
+    today_pacific = datetime.now(PACIFIC_TZ).date()
     data = {
         "daily_usage": usage,
-        "usage_date": str(datetime.now().date())
+        "usage_date": str(today_pacific)
     }
     try:
         client = get_storage_client()
@@ -203,8 +212,6 @@ def draw_credit_donut(used, total=3000):
 ##############################################################################
 # 4) YOUTUBE DATA FETCHING / FILTERING
 ##############################################################################
-import isodate
-
 def format_duration(duration_iso):
     if not duration_iso:
         return "00:00:00"
@@ -356,7 +363,7 @@ def fetch_videos_for_keyword_until_filtered(
             cid = r["Channel ID"]
             (subs_raw, country) = channel_stats_map.get(cid, ("HIDDEN", "N/A"))
 
-            # interpret HIDDEN as 0 or let pass
+            # interpret HIDDEN as 0
             if isinstance(subs_raw, str) and subs_raw == "HIDDEN":
                 sub_count_num = 0
             else:
@@ -400,6 +407,7 @@ def process_data(df: pd.DataFrame):
     df_all_videos = df.copy()
     df_all_videos["Number of Video Published"] = df_all_videos["Channel Name"].map(channel_counts)
 
+    # For each channel, pick the row with the highest view count
     df_unique_channels = df_all_videos.loc[
         df_all_videos.groupby("Channel Name")["View Count"].idxmax()
     ]
@@ -452,16 +460,15 @@ def main():
         st.write(f"**Used:** {used}")
         st.write(f"**Remaining:** {leftover}")
 
-        import pytz
-        paris_tz = pytz.timezone("Europe/Paris")
-        now_paris = datetime.now(paris_tz)
-        next_noon = now_paris.replace(hour=12, minute=0, second=0, microsecond=0)
-        if now_paris >= next_noon:
+        # Show time until 12:00 PM Pacific
+        now_pacific = datetime.now(PACIFIC_TZ)
+        next_noon = now_pacific.replace(hour=12, minute=0, second=0, microsecond=0)
+        if now_pacific >= next_noon:
             next_noon += timedelta(days=1)
-        time_to_reset = next_noon - now_paris
+        time_to_reset = next_noon - now_pacific
         hours = time_to_reset.seconds // 3600
         minutes = (time_to_reset.seconds // 60) % 60
-        st.write(f"Credits reset in {hours}h {minutes}m (12:00 PM Paris Time).")
+        st.write(f"Credits reset in {hours}h {minutes}m (12:00 PM Pacific Time).")
 
         api_key = load_credentials()
         if not api_key:
@@ -662,15 +669,7 @@ def main():
 
             info_df = pd.DataFrame(info_rows)
 
-            # Convert each DF to Excel with the extra "Filters" sheet
-            raw_bytes = b""
-            if not df_raw.empty:
-                raw_bytes = df_to_excel_bytes_with_info(
-                    df_raw, info_df,
-                    data_sheet_name="Raw Data",
-                    info_sheet_name="Filters"
-                )
-
+            # 1) Filtered Data
             filtered_bytes = b""
             if not df_all_filtered.empty:
                 filtered_bytes = df_to_excel_bytes_with_info(
@@ -679,6 +678,7 @@ def main():
                     info_sheet_name="Filters"
                 )
 
+            # 2) Unique Data
             unique_bytes = b""
             if not df_unique_filtered.empty:
                 unique_bytes = df_to_excel_bytes_with_info(
@@ -687,12 +687,31 @@ def main():
                     info_sheet_name="Filters"
                 )
 
-            # Build final ZIP: no text file now
-            file_dict = {
-                f"{base_name} All Videos Filtered.xlsx": filtered_bytes,
-                f"{base_name} Unique Channels Filtered.xlsx": unique_bytes,
-                f"{base_name} Raw - All Videos Unfiltered.xlsx": raw_bytes
-            }
+            # 3) Raw Data (EXCLUDING whatever is in the filtered set)
+            raw_bytes = b""
+            if not df_raw.empty:
+                if not df_all_filtered.empty:
+                    # Exclude any video that's already in the "All Videos Filtered"
+                    df_raw_excluding = df_raw[~df_raw["Video URL"].isin(df_all_filtered["Video URL"])]
+                else:
+                    # If there's nothing in df_all_filtered, just keep df_raw as is
+                    df_raw_excluding = df_raw
+
+                if not df_raw_excluding.empty:
+                    raw_bytes = df_to_excel_bytes_with_info(
+                        df_raw_excluding, info_df,
+                        data_sheet_name="Raw Data",
+                        info_sheet_name="Filters"
+                    )
+
+            # Build final ZIP
+            file_dict = {}
+            if filtered_bytes:
+                file_dict[f"{base_name} All Videos Filtered.xlsx"] = filtered_bytes
+            if unique_bytes:
+                file_dict[f"{base_name} Unique Channels Filtered.xlsx"] = unique_bytes
+            if raw_bytes:
+                file_dict[f"{base_name} Raw Videos Unfiltered (Excluding Filtered).xlsx"] = raw_bytes
 
             zipped_files = create_zip_file(file_dict)
 
