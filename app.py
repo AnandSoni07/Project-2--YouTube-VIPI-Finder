@@ -757,11 +757,7 @@ def main():
             st.warning("No valid YouTube API key found. Please update credentials to proceed.")
 
     st.title("YouTube VIPI Discovery Tool")
-    st.write("""
-    This version enumerates ALL leads & contacts via .list(...) (the old approach). 
-    It also tries to store channel handles if available, and uses 
-    "Total Videos" + "Unique channels discovered" in the final summary.
-    """)
+    
     st.divider()
 
     # ---------- CONFIGURE SEARCH
