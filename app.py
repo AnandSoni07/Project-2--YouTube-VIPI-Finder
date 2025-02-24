@@ -532,15 +532,34 @@ def parse_channel_id_from_crm(link: str) -> str:
 # ---------------------------------------------------------------------
 def create_lead_and_note(z_client, lead_payload, channel_row):
     new_lead = z_client.leads.create(lead_payload)
-    lines = ["**Channel Info:**"]
+    
+    # Start with a separator
+    lines = ["---\n"]  # Add initial separator and blank line
+    
+    # Channel Info section
+    lines.append("**Channel Info:**\n")  # Add blank line after header
+
     lines.append(f"Channel Name: {channel_row.get('Channel Name','Unknown')}")
     lines.append(f"Subscribers: {channel_row.get('Number of Subscribers',0)}")
     lines.append(f"Country: {channel_row.get('Country of Origin','N/A')}")
     lines.append(f"Channel URL: {channel_row.get('Channel URL','')}")
+    lines.append("")  # Add blank line after channel info
+
+    # Video information section
     video_info = channel_row.get("Video Info", "")
     if video_info:
-        lines.append("**Top Videos:**")
+        lines.append("**Top Videos:**\n")  # Add blank line after header
         lines.append(video_info)
+        lines.append("")  # Add blank line after videos
+
+    # Search filters section
+    search_filters = st.session_state.get("search_filters", None)
+    if search_filters:
+        lines.append("**Search Filters:**\n")  # Add blank line after header
+        lines.append(f"Upload Date Filter: {search_filters.get('Upload Date Filter', 'No filter')}")
+        lines.append(f"Subscriber Count Filter: {search_filters.get('Subscriber Count Filter', 'No filter')}")
+        lines.append(f"Keyword(s): {search_filters.get('Keyword(s)', 'None')}")
+    
     note_content = "\n".join(lines)
     z_client.notes.create({
         "resource_type": "lead",
@@ -821,12 +840,24 @@ def main():
             info_rows.append({"Parameter": f"Keyword {idx}", "Value": f"{kv['keyword']} (count={kv['count']})"})
             idx += 1
         info_df = pd.DataFrame(info_rows)
+        # Save search filter info in session state for use in lead notes.
+        st.session_state["search_filters"] = {
+            "Upload Date Filter": date_filter_choice,
+            "Subscriber Count Filter": sub_filter_choice,
+            "Keyword(s)": ", ".join([kv["keyword"] for kv in valid_keywords])
+        }
         file_dict = {}
         all_bytes = df_to_excel_bytes_with_info(df_all_channels, info_df, "All Channels", "Filters")
-        file_dict[f"{base_name} ALL Channels.xlsx"] = all_bytes
         raw_bytes = df_to_excel_bytes_with_info(df_raw_channels, info_df, "RAW Channels", "Filters")
-        file_dict[f"{base_name} RAW Channels.xlsx"] = raw_bytes
         filt_bytes = df_to_excel_bytes_with_info(df_filtered_channels, info_df, "FILTERED Channels", "Filters")
+        
+        # Store bytes in session state for later use
+        st.session_state["all_bytes"] = all_bytes
+        st.session_state["raw_bytes"] = raw_bytes
+        st.session_state["filt_bytes"] = filt_bytes
+        
+        file_dict[f"{base_name} ALL Channels.xlsx"] = all_bytes
+        file_dict[f"{base_name} RAW Channels.xlsx"] = raw_bytes
         file_dict[f"{base_name} FILTERED Channels.xlsx"] = filt_bytes
         final_zip = create_zip_file(file_dict)
         st.subheader("Download Your Results")
@@ -1005,19 +1036,107 @@ def main():
                         st.info("No RAW channels selected for import.")
                 if final_imported_frames:
                     combined_import_df = pd.concat(final_imported_frames, ignore_index=True)
-                    xlsx_import = df_to_excel_bytes_with_info(
+                    
+                    # Create filtered_keys set from filtered channels
+                    filtered_keys = set()
+                    df_filt = st.session_state.get("df_filt_nodup", pd.DataFrame())
+                    for idx, row in df_filt.iterrows():
+                        link = row.get("Channel URL", "").strip()
+                        if link:
+                            dedup_key = parse_channel_id_from_crm(link)
+                            filtered_keys.add(dedup_key)
+                    
+                    # Create duplicates DataFrame
+                    df_duplicates = create_duplicates_df(
+                        raw_before=st.session_state.get("raw_before", 0),
+                        raw_after=len(df_rn),
+                        filt_before=st.session_state.get("filt_before", 0),
+                        filt_after=len(df_fn),
+                        existing_channels=existing_channels,
+                        filtered_keys=filtered_keys
+                    )
+                    
+                    # Create a ZIP file with all results
+                    file_dict = {}
+                    
+                    # Add CRM Import Results
+                    crm_import_bytes = df_to_excel_bytes_with_info(
                         combined_import_df, pd.DataFrame(),
                         data_sheet_name="CRM Import Results",
                         info_sheet_name="Info"
                     )
+                    file_dict["CRM Import Results.xlsx"] = crm_import_bytes
+                    
+                    # Add original processed files from session state
+                    file_dict[f"{base_name} ALL Channels.xlsx"] = st.session_state.get("all_bytes")
+                    file_dict[f"{base_name} RAW Channels.xlsx"] = st.session_state.get("raw_bytes")
+                    file_dict[f"{base_name} FILTERED Channels.xlsx"] = st.session_state.get("filt_bytes")
+                    
+                    # Add duplicates file if there are any duplicates
+                    if not df_duplicates.empty:
+                        duplicates_bytes = df_to_excel_bytes_with_info(
+                            df_duplicates, pd.DataFrame(),
+                            data_sheet_name="Duplicates",
+                            info_sheet_name="Info"
+                        )
+                        file_dict[f"{base_name} Duplicates.xlsx"] = duplicates_bytes
+                    
+                    # Create final ZIP file
+                    final_zip_all = create_zip_file(file_dict)
+                    
                     st.download_button(
-                        "Download CRM Import Results",
-                        data=xlsx_import,
-                        file_name="CRM_Import_Results.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        "Download CRM Import Results + Processed Data",
+                        data=final_zip_all,
+                        file_name=f"{base_name}_all_results.zip",
+                        mime="application/zip"
                     )
                 else:
                     st.info("No leads imported. Possibly all channels unchecked or empty results.")
+
+def create_duplicates_df(raw_before, raw_after, filt_before, filt_after, existing_channels, filtered_keys):
+    duplicates = []
+    
+    # Track duplicates from RAW channels
+    raw_removed = []
+    for idx, row in st.session_state.get("df_raw_channels", pd.DataFrame()).iterrows():
+        link = row.get("Channel URL", "").strip()
+        if link:
+            dedup_key = parse_channel_id_from_crm(link)
+            if dedup_key in existing_channels:
+                row_data = row.to_dict()
+                row_data["Duplicate Type"] = "Already exists in CRM"
+                row_data["Channel Type"] = "RAW"
+                duplicates.append(row_data)
+            elif dedup_key in filtered_keys:
+                row_data = row.to_dict()
+                row_data["Duplicate Type"] = "Already exists in FILTERED results"
+                row_data["Channel Type"] = "RAW"
+                duplicates.append(row_data)
+
+    # Track duplicates from FILTERED channels
+    for idx, row in st.session_state.get("df_filtered_channels", pd.DataFrame()).iterrows():
+        link = row.get("Channel URL", "").strip()
+        if link:
+            dedup_key = parse_channel_id_from_crm(link)
+            if dedup_key in existing_channels:
+                row_data = row.to_dict()
+                row_data["Duplicate Type"] = "Already exists in CRM"
+                row_data["Channel Type"] = "FILTERED"
+                duplicates.append(row_data)
+
+    if not duplicates:
+        return pd.DataFrame()
+
+    df_duplicates = pd.DataFrame(duplicates)
+    
+    # Reorder columns to put important information first
+    columns_order = ["Channel Type", "Duplicate Type", "Channel ID", "Channel URL", "Channel Name",
+                    "Number of Subscribers", "Country of Origin", "Video Info"]
+    columns_order = [c for c in columns_order if c in df_duplicates.columns]
+    remaining_cols = [c for c in df_duplicates.columns if c not in columns_order]
+    df_duplicates = df_duplicates[columns_order + remaining_cols]
+    
+    return df_duplicates
 
 if __name__ == "__main__":
     main()
