@@ -229,7 +229,7 @@ def draw_credit_donut(used, total=3000):
     return chart
 
 # ---------------------------------------------------------------------
-# 4) YouTube Data Fetching (unchanged)
+# 4) YouTube Data Fetching (unchanged except for sort order)
 # ---------------------------------------------------------------------
 def format_duration(duration_iso):
     if not duration_iso:
@@ -262,6 +262,33 @@ def map_country_code_to_fullname(country_code):
     except Exception:
         pass
     return country_code
+
+def is_youtube_short(video_url, duration_str):
+    """
+    Determines if a video is likely a YouTube Short
+    Args:
+        video_url: The full YouTube video URL
+        duration_str: Duration in format "HH:MM:SS"
+    
+    Returns:
+        Boolean indicating if it's likely a Short
+    """
+    # Check URL pattern (if it contains /shorts/)
+    is_shorts_url = "/shorts/" in video_url
+    
+    # Check for common shorts hashtags in the URL
+    has_shorts_hashtag = "#shorts" in video_url.lower() or "#short" in video_url.lower()
+    
+    # Check duration (Shorts are typically ≤ 60 seconds)
+    try:
+        h, m, s = map(int, duration_str.split(":"))
+        duration_seconds = h * 3600 + m * 60 + s
+        is_shorts_duration = duration_seconds <= 60
+    except:
+        is_shorts_duration = False
+    
+    # If URL is explicitly a Shorts URL, has shorts hashtag, or duration is under 60s
+    return is_shorts_url or has_shorts_hashtag or is_shorts_duration
 
 def get_standard_country_name(input_country):
     if not input_country or input_country.upper() == "N/A":
@@ -300,7 +327,7 @@ def build_channel_url(citem):
 def fetch_videos_for_keyword_until_filtered(
     youtube, keyword, target_count, published_after,
     below20k, below50k, above50k,
-    daily_usage
+    daily_usage, order_filter, shorts_filter="Include all videos"
 ):
     raw_results = []
     filtered_results = []
@@ -314,10 +341,14 @@ def fetch_videos_for_keyword_until_filtered(
             type='video',
             part='id,snippet',
             maxResults=50,
-            order='viewCount',
+            order=order_filter,
             pageToken=next_page_token,
             publishedAfter=published_after
         )
+        
+        # Log the search parameters to verify order_filter is correctly passed
+        logging.info(f"YouTube API search with: keyword='{keyword}', order='{order_filter}', filter={shorts_filter}")
+        
         try:
             resp = search_req.execute()
         except HttpError as e:
@@ -428,6 +459,15 @@ def fetch_videos_for_keyword_until_filtered(
             r["View Count"] = vstat[0]
             r["Duration"] = vstat[1]
             r["Number of Subscribers"] = sub_count_num
+            
+            # Detect if this is a YouTube Short
+            r["Is Short"] = is_youtube_short(r["Video URL"], vstat[1])
+            
+            # Apply Shorts filter if needed
+            if (shorts_filter == "Exclude Shorts" and r["Is Short"]) or \
+               (shorts_filter == "Only show Shorts" and not r["Is Short"]):
+                continue  # Skip this video based on Shorts filter
+                
             if passes_subscriber_filter(sub_count_num, below20k, below50k, above50k):
                 if r["Video URL"] not in collected_urls_filtered:
                     filtered_results.append(r)
@@ -474,6 +514,57 @@ def build_unique_channels_df(video_df: pd.DataFrame, is_filtered: bool, video_in
     grouping["IsFiltered"] = is_filtered
     grouping["Video Info"] = grouping["Channel ID"].map(video_info) if video_info else ""
     return grouping
+
+def analyze_search_results_by_order(df_videos, sort_order):
+    """
+    Analyzes video results to validate if the sort order appears to be applied correctly.
+    Returns stats and a boolean indicating if the sort order appears valid.
+    """
+    if df_videos.empty:
+        return {}, False
+    
+    # Add numeric view count field
+    df_videos["View Count Numeric"] = pd.to_numeric(df_videos["View Count"], errors="coerce").fillna(0)
+    
+    # Get basic stats
+    total_videos = len(df_videos)
+    total_views = df_videos["View Count Numeric"].sum()
+    avg_views = df_videos["View Count Numeric"].mean()
+    median_views = df_videos["View Count Numeric"].median()
+    
+    # Check if sort order appears valid
+    if sort_order == "Most Watched":
+        # For viewCount, we expect the first videos to have more views than later ones
+        # Check if the first quarter has significantly more views than the last quarter
+        if total_videos >= 4:
+            quarter_size = total_videos // 4
+            first_quarter = df_videos.iloc[:quarter_size]["View Count Numeric"].mean()
+            last_quarter = df_videos.iloc[-quarter_size:]["View Count Numeric"].mean()
+            order_seems_valid = first_quarter > (last_quarter * 1.5)  # 50% more views in first quarter
+        else:
+            # Not enough videos for comparison
+            order_seems_valid = True
+    else:
+        # For relevance, we can't easily verify through statistics
+        # We'll check if there's keyword match in titles - this is imperfect but helpful
+        keywords = df_videos["Keyword"].unique()
+        keyword_match_count = 0
+        for idx, row in df_videos.iterrows():
+            title = row["Video Title"].lower()
+            keyword = row["Keyword"].lower()
+            if keyword in title:
+                keyword_match_count += 1
+                
+        keyword_match_percent = (keyword_match_count / total_videos) * 100 if total_videos > 0 else 0
+        order_seems_valid = keyword_match_percent >= 40  # At least 40% should have keyword in title
+    
+    return {
+        "total_videos": total_videos,
+        "total_views": total_views,
+        "avg_views": avg_views,
+        "median_views": median_views,
+        "order_seems_valid": order_seems_valid
+    }, order_seems_valid
 
 # ---------------------------------------------------------------------
 # Excel/ZIP Helpers
@@ -534,31 +625,32 @@ def create_lead_and_note(z_client, lead_payload, channel_row):
     new_lead = z_client.leads.create(lead_payload)
     
     # Start with a separator
-    lines = ["---\n"]  # Add initial separator and blank line
+    lines = ["---\n"]
     
     # Channel Info section
-    lines.append("**Channel Info:**\n")  # Add blank line after header
-
+    lines.append("**Channel Info:**\n")
     lines.append(f"Channel Name: {channel_row.get('Channel Name','Unknown')}")
     lines.append(f"Subscribers: {channel_row.get('Number of Subscribers',0)}")
     lines.append(f"Country: {channel_row.get('Country of Origin','N/A')}")
     lines.append(f"Channel URL: {channel_row.get('Channel URL','')}")
-    lines.append("")  # Add blank line after channel info
-
+    lines.append("")
+    
     # Video information section
     video_info = channel_row.get("Video Info", "")
     if video_info:
-        lines.append("**Top Videos:**\n")  # Add blank line after header
+        lines.append("**Top Videos:**\n")
         lines.append(video_info)
-        lines.append("")  # Add blank line after videos
-
+        lines.append("")
+    
     # Search filters section
     search_filters = st.session_state.get("search_filters", None)
     if search_filters:
-        lines.append("**Search Filters:**\n")  # Add blank line after header
+        lines.append("**Search Filters:**\n")
         lines.append(f"Upload Date Filter: {search_filters.get('Upload Date Filter', 'No filter')}")
         lines.append(f"Subscriber Count Filter: {search_filters.get('Subscriber Count Filter', 'No filter')}")
         lines.append(f"Keyword(s): {search_filters.get('Keyword(s)', 'None')}")
+        lines.append(f"Sort Order: {search_filters.get('Sort Order', 'Relevance')}")
+        lines.append(f"Shorts Filter: {search_filters.get('Shorts Filter', 'Include all videos')}")
     
     note_content = "\n".join(lines)
     z_client.notes.create({
@@ -680,6 +772,15 @@ def fetch_existing_youtube_values(z_client):
 # ---------------------------------------------------------------------
 def main():
     st.set_page_config(page_title="YouTube VIPI Discovery Tool", layout="wide")
+    if "search_history" not in st.session_state:
+        st.session_state["search_history"] = []
+        
+    # Initialize session state variables
+    if "search_done" not in st.session_state:
+        st.session_state["search_done"] = False
+    if "duplicates_checked" not in st.session_state:
+        st.session_state["duplicates_checked"] = False
+        
     if "usage_loaded" not in st.session_state:
         used, usage_date = load_daily_usage()
         st.session_state["usage_loaded"] = True
@@ -763,6 +864,18 @@ def main():
     below20k = (sub_filter_choice == "Up to 20K")
     below50k = (sub_filter_choice == "Up to 50K")
     above50k = (sub_filter_choice == "Above 50K")
+    st.subheader("Select Sort Order")
+    sort_order = st.radio("Choose sort order:", options=["Relevance", "Most Watched"], index=0)
+    # Convert sort order to the corresponding YouTube API parameter
+    youtube_order = "relevance" if sort_order == "Relevance" else "viewCount"
+    
+    st.subheader("YouTube Shorts Filter")
+    shorts_filter = st.radio(
+        "Include YouTube Shorts?",
+        ["Include all videos", "Exclude Shorts", "Only show Shorts"],
+        index=0
+    )
+    
     st.subheader("Give Your Output File a Name")
     base_name = st.text_input("Output file base name:", value="MySearch")
     run_search = st.button("Run YouTube Search & Process Channels")
@@ -805,7 +918,9 @@ def main():
                 below20k=below20k,
                 below50k=below50k,
                 above50k=above50k,
-                daily_usage=new_used
+                daily_usage=new_used,
+                order_filter=youtube_order,
+                shorts_filter=shorts_filter
             )
             raw_videos_all.extend(rv)
             filtered_videos_all.extend(fv)
@@ -815,6 +930,50 @@ def main():
         st.session_state["used_credits"] = new_used
         st.success(f"Search complete! Found {len(filtered_videos_all)} filtered videos total.")
         st.info(f"Used {new_used} of {DAILY_LIMIT} credits so far today.")
+        
+        # Show applied filters for verification
+        st.write("**Applied filters:**")
+        st.write(f"• Sort order: **{sort_order}** (YouTube API parameter: '{youtube_order}')")
+        st.write(f"• Shorts filter: **{shorts_filter}**")
+        st.write(f"• Upload date: **{date_filter_choice}**")
+        st.write(f"• Subscriber range: **{sub_filter_choice}**")
+        
+        # Analyze if sort order seems to be working
+        if len(filtered_videos_all) > 0:
+            df_filtered_videos = pd.DataFrame(filtered_videos_all)
+            
+            # Add View Count Numeric for analysis
+            df_filtered_videos["View Count Numeric"] = pd.to_numeric(df_filtered_videos["View Count"], errors="coerce").fillna(0)
+            
+            analysis, seems_valid = analyze_search_results_by_order(df_filtered_videos, sort_order)
+            
+            with st.expander("Sort Order Analysis (Click to expand)"):
+                if sort_order == "Most Watched":
+                    st.write("**Most Watched Analysis:**")
+                    st.write(f"• Average views: {int(analysis.get('avg_views', 0)):,}")
+                    if analysis.get('total_videos', 0) >= 4:
+                        quarter_size = analysis.get('total_videos', 0) // 4
+                        st.write(f"• First {quarter_size} videos avg views: {int(df_filtered_videos.iloc[:quarter_size]['View Count Numeric'].mean()):,}")
+                        st.write(f"• Last {quarter_size} videos avg views: {int(df_filtered_videos.iloc[-quarter_size:]['View Count Numeric'].mean()):,}")
+                else:
+                    st.write("**Relevance Analysis:**")
+                    # Count how many video titles contain the keyword
+                    keywords = df_filtered_videos["Keyword"].unique()
+                    keyword_match_count = 0
+                    for idx, row in df_filtered_videos.iterrows():
+                        title = row["Video Title"].lower()
+                        keyword = row["Keyword"].lower()
+                        if keyword in title:
+                            keyword_match_count += 1
+                    
+                    keyword_match_percent = (keyword_match_count / len(df_filtered_videos)) * 100
+                    st.write(f"• Videos with keyword in title: {keyword_match_count} ({keyword_match_percent:.1f}%)")
+                
+                if seems_valid:
+                    st.success(f"The '{sort_order}' sort order appears to be working properly.")
+                else:
+                    st.warning(f"The '{sort_order}' sort order may not be working as expected. Review the results.")
+        
         sum_of_videos = len(raw_videos_all) + len(filtered_videos_all)
         st.session_state["total_videos_discovered"] = sum_of_videos
         df_all_videos = pd.concat([pd.DataFrame(raw_videos_all), pd.DataFrame(filtered_videos_all)], ignore_index=True)
@@ -826,45 +985,118 @@ def main():
         df_all_channels = pd.concat([df_raw_channels, df_filtered_channels], ignore_index=True)
         df_all_channels.drop_duplicates(subset=["Channel ID"], inplace=True)
         discovered_count = len(df_all_channels)
-        st.session_state["discovered_count"] = discovered_count
+        
+        # Store all relevant DataFrames and result data in session state
+        st.session_state["raw_videos_all"] = raw_videos_all
+        st.session_state["filtered_videos_all"] = filtered_videos_all
+        st.session_state["df_raw_videos"] = df_raw_videos
+        st.session_state["df_filtered_videos"] = df_filtered_videos
         st.session_state["df_raw_channels"] = df_raw_channels
         st.session_state["df_filtered_channels"] = df_filtered_channels
+        st.session_state["df_all_channels"] = df_all_channels
+        st.session_state["video_info_dict"] = video_info_dict
+        st.session_state["discovered_count"] = discovered_count
+        
         st.session_state["search_done"] = True
         st.session_state["duplicates_checked"] = False
+        
+        # Save search filter info in session state for use in lead notes.
+        st.session_state["search_filters"] = {
+            "Upload Date Filter": date_filter_choice,
+            "Subscriber Count Filter": sub_filter_choice,
+            "Keyword(s)": ", ".join([kv["keyword"] for kv in valid_keywords]),
+            "Sort Order": sort_order,
+            "Shorts Filter": shorts_filter
+        }
         info_rows = [
             {"Parameter": "Upload Date Filter", "Value": date_filter_choice},
             {"Parameter": "Subscriber Filter", "Value": sub_filter_choice},
+            {"Parameter": "Sort Order", "Value": sort_order},
+            {"Parameter": "Shorts Filter", "Value": shorts_filter}
         ]
         idx = 1
         for kv in valid_keywords:
             info_rows.append({"Parameter": f"Keyword {idx}", "Value": f"{kv['keyword']} (count={kv['count']})"})
             idx += 1
         info_df = pd.DataFrame(info_rows)
-        # Save search filter info in session state for use in lead notes.
-        st.session_state["search_filters"] = {
-            "Upload Date Filter": date_filter_choice,
-            "Subscriber Count Filter": sub_filter_choice,
-            "Keyword(s)": ", ".join([kv["keyword"] for kv in valid_keywords])
-        }
-        file_dict = {}
+        
+        # Create Excel files for download
         all_bytes = df_to_excel_bytes_with_info(df_all_channels, info_df, "All Channels", "Filters")
         raw_bytes = df_to_excel_bytes_with_info(df_raw_channels, info_df, "RAW Channels", "Filters")
         filt_bytes = df_to_excel_bytes_with_info(df_filtered_channels, info_df, "FILTERED Channels", "Filters")
         
-        # Store bytes in session state for later use
+        # Store these in session state
         st.session_state["all_bytes"] = all_bytes
         st.session_state["raw_bytes"] = raw_bytes
         st.session_state["filt_bytes"] = filt_bytes
         
+        # Create zip file
+        file_dict = {}
         file_dict[f"{base_name} ALL Channels.xlsx"] = all_bytes
         file_dict[f"{base_name} RAW Channels.xlsx"] = raw_bytes
         file_dict[f"{base_name} FILTERED Channels.xlsx"] = filt_bytes
         final_zip = create_zip_file(file_dict)
+        
+        # Store zip in session state
+        st.session_state["final_zip"] = final_zip
+        
         st.subheader("Download Your Results")
         st.download_button("Download Processed Channels (ZIP)",
                            data=final_zip,
                            file_name=f"{base_name}_processed_channels.zip",
                            mime="application/zip")
+        
+        # Add this search to history
+        search_entry = {
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "keywords": ", ".join([kv["keyword"] for kv in valid_keywords]),
+            "sort_order": sort_order,
+            "shorts_filter": shorts_filter,
+            "date_filter": date_filter_choice,
+            "subscriber_filter": sub_filter_choice,
+            "result_count": len(filtered_videos_all)
+        }
+        
+        # Calculate average views if results exist
+        if len(filtered_videos_all) > 0:
+            df_temp = pd.DataFrame(filtered_videos_all)
+            df_temp["View Count Numeric"] = pd.to_numeric(df_temp["View Count"], errors="coerce").fillna(0)
+            search_entry["avg_views"] = int(df_temp["View Count Numeric"].mean())
+        else:
+            search_entry["avg_views"] = 0
+        
+        # Keep only the last 5 searches
+        st.session_state["search_history"].append(search_entry)
+        if len(st.session_state["search_history"]) > 5:
+            st.session_state["search_history"] = st.session_state["search_history"][-5:]
+            
+        # Display search history comparison if there are multiple entries
+        if len(st.session_state["search_history"]) > 1:
+            with st.expander("Compare with Previous Searches"):
+                history_df = pd.DataFrame(st.session_state["search_history"])
+                st.dataframe(history_df, use_container_width=True)
+                
+                # Only show chart if we have multiple searches with different parameters
+                if len(history_df["sort_order"].unique()) > 1:
+                    st.write("**Result counts by sort order:**")
+                    chart = alt.Chart(history_df).mark_bar().encode(
+                        x='sort_order',
+                        y='result_count',
+                        color='sort_order',
+                        tooltip=['keywords', 'sort_order', 'result_count', 'avg_views']
+                    ).properties(width=300, height=200)
+                    st.altair_chart(chart)
+                    
+    # Add a check here to reload previous search data if needed
+    elif st.session_state.get("search_done") and not st.session_state.get("duplicates_checked"):
+        # If we have previous search data but haven't checked duplicates, show the download button again
+        if "final_zip" in st.session_state and "base_name" in locals():
+            st.subheader("Download Your Previous Results")
+            st.download_button("Download Processed Channels (ZIP)",
+                               data=st.session_state["final_zip"],
+                               file_name=f"{base_name}_processed_channels.zip",
+                               mime="application/zip")
+
     if st.session_state.get("search_done"):
         st.divider()
         st.header("Fetch Existing CRM Data")
@@ -874,8 +1106,11 @@ def main():
             return
         z_client = BaseClient(access_token=z_token)
         if st.button("Fetch Existing CRM Data"):
-            # New internal process: For each owner, fetch contacts and leads,
-            # then filter records that are tagged with "Youtube-VIPI" (i.e. those with a filled "Youtube" field)
+            # Check if necessary dataframes exist in session state
+            if "df_raw_channels" not in st.session_state or "df_filtered_channels" not in st.session_state:
+                st.error("Search results data is missing. Please run the search again.")
+                return
+                
             existing_set, lead_count, contact_count = fetch_existing_youtube_values(z_client)
             st.session_state["existing_channels"] = existing_set
             st.session_state["lead_count"] = lead_count
@@ -889,7 +1124,14 @@ def main():
 
             new_filt_rows = []
             for idx, row in df_filt.iterrows():
-                link = row.get("Channel URL", "").strip()
+                # Add safety check for row
+                if row is None:
+                    continue
+                link = row.get("Channel URL", "")
+                # Add safety check for link
+                if link is None:
+                    continue
+                link = link.strip()
                 if link:
                     dedup_key = parse_channel_id_from_crm(link)
                     if dedup_key not in existing_set:
@@ -898,14 +1140,28 @@ def main():
 
             filtered_keys = set()
             for idx, row in df_filt.iterrows():
-                link = row.get("Channel URL", "").strip()
+                # Add safety check for row
+                if row is None:
+                    continue
+                link = row.get("Channel URL", "")
+                # Add safety check for link
+                if link is None:
+                    continue
+                link = link.strip()
                 if link:
                     dedup_key = parse_channel_id_from_crm(link)
                     filtered_keys.add(dedup_key)
 
             new_raw_rows = []
             for idx, row in df_raw.iterrows():
-                link = row.get("Channel URL", "").strip()
+                # Add safety check for row
+                if row is None:
+                    continue
+                link = row.get("Channel URL", "")
+                # Add safety check for link
+                if link is None:
+                    continue
+                link = link.strip()
                 if link:
                     dedup_key = parse_channel_id_from_crm(link)
                     if (dedup_key not in existing_set) and (dedup_key not in filtered_keys):
@@ -918,7 +1174,8 @@ def main():
             st.session_state["df_raw_nodup"] = df_raw
             st.session_state["df_filt_nodup"] = df_filt
             st.session_state["duplicates_checked"] = True
-
+        
+        # Rest of the CRM processing code...
         if st.session_state.get("duplicates_checked"):
             st.subheader("Summary Statistics")
             total_videos = st.session_state.get("total_videos_discovered", 0)
@@ -931,9 +1188,28 @@ def main():
             filt_before = st.session_state.get("filt_before", 0)
             df_rn = st.session_state.get("df_raw_nodup", pd.DataFrame())
             df_fn = st.session_state.get("df_filt_nodup", pd.DataFrame())
-            raw_removed = raw_before - len(df_rn)
-            filt_removed = filt_before - len(df_fn)
-            total_removed = raw_removed + filt_removed
+            
+            # Get unique channel IDs from before deduplication
+            all_channels_before = set()
+            for _, row in st.session_state.get("df_raw_channels", pd.DataFrame()).iterrows():
+                if "Channel URL" in row and row.get("Channel URL") is not None and row["Channel URL"].strip():
+                    all_channels_before.add(parse_channel_id_from_crm(row["Channel URL"]))
+            for _, row in st.session_state.get("df_filtered_channels", pd.DataFrame()).iterrows():
+                if "Channel URL" in row and row.get("Channel URL") is not None and row["Channel URL"].strip():
+                    all_channels_before.add(parse_channel_id_from_crm(row["Channel URL"]))
+                
+            # Get unique channel IDs after deduplication
+            all_channels_after = set()
+            for _, row in df_rn.iterrows():
+                if "Channel URL" in row and row.get("Channel URL") is not None and row["Channel URL"].strip():
+                    all_channels_after.add(parse_channel_id_from_crm(row["Channel URL"]))
+            for _, row in df_fn.iterrows():
+                if "Channel URL" in row and row.get("Channel URL") is not None and row["Channel URL"].strip():
+                    all_channels_after.add(parse_channel_id_from_crm(row["Channel URL"]))
+                
+            # True duplicate count
+            total_removed = len(all_channels_before) - len(all_channels_after)
+            
             st.write(f"- **Duplicates between discovered and CRM:** {total_removed}")
             st.write(f"- **Filtered Channels to Import (currently):** {len(df_fn)}")
             st.write(f"- **RAW (Unfiltered) Channels to Import (currently):** {len(df_rn)}")
@@ -1004,8 +1280,8 @@ def main():
                         first_kw = "NONE"
                         if "keyword_entries" in st.session_state:
                             all_kws = [k["keyword"] for k in st.session_state["keyword_entries"] if k["keyword"]]
-                            if all_kws:
-                                first_kw = all_kws[0]
+                        if all_kws:
+                            first_kw = all_kws[0]
                         updated_f, summary_f = partial_import(z_client, subset_f, first_kw, existing_channels)
                         st.success(
                             f"Filtered import done: Imported={summary_f['imported_count']}, "
@@ -1037,16 +1313,19 @@ def main():
                 if final_imported_frames:
                     combined_import_df = pd.concat(final_imported_frames, ignore_index=True)
                     
-                    # Create filtered_keys set from filtered channels
                     filtered_keys = set()
                     df_filt = st.session_state.get("df_filt_nodup", pd.DataFrame())
                     for idx, row in df_filt.iterrows():
-                        link = row.get("Channel URL", "").strip()
+                        if row is None:
+                            continue
+                        link = row.get("Channel URL", "")
+                        if link is None:
+                            continue
+                        link = link.strip()
                         if link:
                             dedup_key = parse_channel_id_from_crm(link)
                             filtered_keys.add(dedup_key)
                     
-                    # Create duplicates DataFrame
                     df_duplicates = create_duplicates_df(
                         raw_before=st.session_state.get("raw_before", 0),
                         raw_after=len(df_rn),
@@ -1056,10 +1335,8 @@ def main():
                         filtered_keys=filtered_keys
                     )
                     
-                    # Create a ZIP file with all results
                     file_dict = {}
                     
-                    # Add CRM Import Results
                     crm_import_bytes = df_to_excel_bytes_with_info(
                         combined_import_df, pd.DataFrame(),
                         data_sheet_name="CRM Import Results",
@@ -1067,12 +1344,10 @@ def main():
                     )
                     file_dict["CRM Import Results.xlsx"] = crm_import_bytes
                     
-                    # Add original processed files from session state
                     file_dict[f"{base_name} ALL Channels.xlsx"] = st.session_state.get("all_bytes")
                     file_dict[f"{base_name} RAW Channels.xlsx"] = st.session_state.get("raw_bytes")
                     file_dict[f"{base_name} FILTERED Channels.xlsx"] = st.session_state.get("filt_bytes")
                     
-                    # Add duplicates file if there are any duplicates
                     if not df_duplicates.empty:
                         duplicates_bytes = df_to_excel_bytes_with_info(
                             df_duplicates, pd.DataFrame(),
@@ -1081,7 +1356,6 @@ def main():
                         )
                         file_dict[f"{base_name} Duplicates.xlsx"] = duplicates_bytes
                     
-                    # Create final ZIP file
                     final_zip_all = create_zip_file(file_dict)
                     
                     st.download_button(
@@ -1096,40 +1370,52 @@ def main():
 def create_duplicates_df(raw_before, raw_after, filt_before, filt_after, existing_channels, filtered_keys):
     duplicates = []
     
-    # Track duplicates from RAW channels
-    raw_removed = []
-    for idx, row in st.session_state.get("df_raw_channels", pd.DataFrame()).iterrows():
-        link = row.get("Channel URL", "").strip()
-        if link:
-            dedup_key = parse_channel_id_from_crm(link)
-            if dedup_key in existing_channels:
-                row_data = row.to_dict()
-                row_data["Duplicate Type"] = "Already exists in CRM"
-                row_data["Channel Type"] = "RAW"
-                duplicates.append(row_data)
-            elif dedup_key in filtered_keys:
-                row_data = row.to_dict()
-                row_data["Duplicate Type"] = "Already exists in FILTERED results"
-                row_data["Channel Type"] = "RAW"
-                duplicates.append(row_data)
+    # Safety check for raw channels
+    df_raw_channels = st.session_state.get("df_raw_channels")
+    if df_raw_channels is not None and not df_raw_channels.empty:
+        for idx, row in df_raw_channels.iterrows():
+            if row is None:
+                continue
+            link = row.get("Channel URL", "")
+            if link is None:
+                continue
+            link = link.strip()
+            if link:
+                dedup_key = parse_channel_id_from_crm(link)
+                if dedup_key in existing_channels:
+                    row_data = row.to_dict()
+                    row_data["Duplicate Type"] = "Already exists in CRM"
+                    row_data["Channel Type"] = "RAW"
+                    duplicates.append(row_data)
+                elif dedup_key in filtered_keys:
+                    row_data = row.to_dict()
+                    row_data["Duplicate Type"] = "Already exists in FILTERED results"
+                    row_data["Channel Type"] = "RAW"
+                    duplicates.append(row_data)
 
-    # Track duplicates from FILTERED channels
-    for idx, row in st.session_state.get("df_filtered_channels", pd.DataFrame()).iterrows():
-        link = row.get("Channel URL", "").strip()
-        if link:
-            dedup_key = parse_channel_id_from_crm(link)
-            if dedup_key in existing_channels:
-                row_data = row.to_dict()
-                row_data["Duplicate Type"] = "Already exists in CRM"
-                row_data["Channel Type"] = "FILTERED"
-                duplicates.append(row_data)
+    # Safety check for filtered channels
+    df_filtered_channels = st.session_state.get("df_filtered_channels")
+    if df_filtered_channels is not None and not df_filtered_channels.empty:
+        for idx, row in df_filtered_channels.iterrows():
+            if row is None:
+                continue
+            link = row.get("Channel URL", "")
+            if link is None:
+                continue
+            link = link.strip()
+            if link:
+                dedup_key = parse_channel_id_from_crm(link)
+                if dedup_key in existing_channels:
+                    row_data = row.to_dict()
+                    row_data["Duplicate Type"] = "Already exists in CRM"
+                    row_data["Channel Type"] = "FILTERED"
+                    duplicates.append(row_data)
 
     if not duplicates:
         return pd.DataFrame()
 
     df_duplicates = pd.DataFrame(duplicates)
     
-    # Reorder columns to put important information first
     columns_order = ["Channel Type", "Duplicate Type", "Channel ID", "Channel URL", "Channel Name",
                     "Number of Subscribers", "Country of Origin", "Video Info"]
     columns_order = [c for c in columns_order if c in df_duplicates.columns]
